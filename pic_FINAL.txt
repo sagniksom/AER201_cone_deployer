@@ -1,0 +1,833 @@
+
+
+#include <xc.h>
+#include <stdbool.h>
+#include <configBits.h>
+#include "lcd.h"
+#include "I2C.h"
+
+
+
+
+
+
+// I2C CODE BEGIN **************************************************************
+// Timer global variables
+unsigned long int lowerBits;    //raw reading from TMR0L register
+unsigned long int upperBits;    //raw reading from TMR0H register
+unsigned long int allBits;      //concatenation of lowerBits and upperBits.
+unsigned long int lastAllBits;  //previous value of allBits. Used to locate edges in order to increment allBitsPeriods.
+long int allBitsPeriods;         //number of times allBits has reached its maximum value and looped to zero.
+double time;                     //time in milliseconds elapsed since the start of the program
+const unsigned long period=65920;  //little period used to prevent error
+unsigned long kdelay=0;        // variable used in non-blocking delay 
+
+
+
+// I2C variables
+unsigned char syncSteps1 = 0;
+unsigned char syncSteps2 = 0;
+unsigned char syncSteps3 = 0;
+unsigned char syncSteps4 = 0;
+int syncStepsReady = 0;
+unsigned int syncSteps = 0;
+
+unsigned char syncTarget1 = 0;
+unsigned char syncTarget2 = 0;
+unsigned char syncTarget3 = 0;
+unsigned char syncTarget4 = 0;
+int syncTargetReady = 0;
+unsigned int syncTarget = 0;
+
+unsigned char syncCracksLeft = 0;
+unsigned char syncCracksCenter = 0;
+unsigned char syncCracksRight = 0;
+unsigned char syncHoles = 0;
+
+unsigned char oldSyncCracksLeft = 0;
+unsigned char oldSyncCracksCenter = 0;
+unsigned char oldSyncCracksRight = 0;
+unsigned char oldSyncHoles = 0;
+
+// Keypad global variables
+int col=0,row=0;    //variables used in loops to multiplex over the keypad colums and rows
+int keys[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};   //raw readings from the keypad
+int mostrecentpress[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};   //raw readings from the keypad
+char state[16] = {'1','2','3','A','4','5','6','B','7','8','9','C','*','0','#','D'};
+int keysDebounced[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};  //debounced readings from the keypad
+int keysTransition[16] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0}; //non-zero values occur only during the exact program loop in which a debounced transition occurs. 1 cooresponds to a press, -1 cooresponds to a release
+double keyStartTimes[16] = {-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1}; //first times at which discreptancies between raw readings and debounced readings were detected
+const double debounceTime = 50;   //time, in ms, between initial keypress detection and reading (for debouncing purposes))
+const unsigned char numrows=4;             //number of rows of keypad
+const unsigned char numcolumns=4;          //number of columns of keypad
+const unsigned char numkeys = 16;           // total number of keys
+
+
+
+//stepper global variables
+float deltatstepper = 1.5;
+double steptime = 0;
+int stepsequence = 0;
+int stepcount = 0;
+int curPos = 20;
+int busy0Chill1 = 1;
+int toMove = 0;
+int dirmTP = 0;
+
+
+//Post-run display vars
+double startTime = 0;
+double endTime = 0;
+//typeList:
+//0: empty
+//1: crack
+//2: hole
+int typeList[30] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+unsigned int distanceList[30] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+int depploy1ignore0[30] = {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0};
+int currentIndex = 0;
+
+
+void updateTime(){ //Updates the time variable using the PIC's internal TIMER0.
+    lowerBits = TMR0L;    // Read the lower 8 bits of TMR0. TMR0L must be read before TMR0H.
+    upperBits = TMR0H;    // Read the upper 8 bits of TMR0.
+    lastAllBits = allBits;  // Save previous value
+    allBits = upperBits * 256 + lowerBits;  // concatenate
+    if(lastAllBits > 32768 && allBits <= 32768){    // Detect if allBits has reset to zero.
+        allBitsPeriods += 1;
+    }
+    time = ( ((double)allBitsPeriods) + ( ((double)allBits) / ((double)65536)) ) * ((double)6712.5);
+}
+
+
+void sendByte(unsigned char sendData) {
+    // Sends a byte of data to the Arduino, overwriting the variable receiveByte on the Arduino side.
+    I2C_Master_Start();
+    I2C_Master_Write(0b00010000); // 7-bit Arduino slave address + write
+    I2C_Master_Write(sendData);
+    I2C_Master_Stop();
+}
+
+unsigned char requestByte() {
+    // Requests a byte of data from the Arduino. The upper four bits are an identifier describing what the lower four bits mean.
+    I2C_Master_Start();
+    I2C_Master_Write(0b00010001); // 7-bit Arduino slave address + read
+    unsigned char arduinoByte = I2C_Master_Read(NACK);
+    I2C_Master_Stop();
+    return(arduinoByte);
+}
+
+void updateSyncVars(unsigned char arduinoByte) {
+    unsigned char identifier = arduinoByte & 0b11110000;
+    unsigned char data = arduinoByte & 0b00001111;
+    
+    if(identifier == 0b00000000) {
+        syncStepsReady = 1;
+        syncSteps1 = data;
+    }
+    else if(identifier == 0b00010000) {
+        syncSteps2 = data;
+    }
+    else if(identifier == 0b00100000) {
+        syncSteps3 = data;
+    }
+    else if(identifier == 0b00110000) {
+        syncSteps4 = data;
+        if(syncStepsReady == 1) {
+            syncSteps = 0;
+            syncSteps = ((unsigned int) (syncSteps1 & 0b00001111)) | ((unsigned int) (syncSteps2 & 0b00001111)) << 4 | ((unsigned int) (syncSteps3 & 0b00001111)) << 8 | ((unsigned int) (syncSteps4 & 0b00001111)) << 12; 
+        }
+        syncStepsReady = 0;
+    }
+    else if(identifier == 0b01000000) {
+        syncTargetReady = 1;
+        syncTarget1 = data;
+    }
+    else if(identifier == 0b01010000) {
+        syncTarget2 = data;
+    }
+    else if(identifier == 0b01100000) {
+        syncTarget3 = data;
+    }
+    else if(identifier == 0b01110000) {
+        syncTarget4 = data;
+        if(syncTargetReady == 1) {
+            syncTarget = 0;
+            syncTarget = ((unsigned int) (syncTarget1 & 0b00001111)) | ((unsigned int) (syncTarget2 & 0b00001111)) << 4 | ((unsigned int) (syncTarget3 & 0b00001111)) << 8 | ((unsigned int) (syncTarget4 & 0b00001111)) << 12; 
+        }
+        syncTargetReady = 0;
+    }
+    else if((identifier == 0b10000000) && (syncCracksLeft != data)) {
+        for(int i = 0; i < 30; i++) {
+            if(typeList[i] == 0) {
+                typeList[i] = 1;
+                distanceList[i] = syncSteps;
+                break;
+            }
+        }
+        syncCracksLeft = data;
+    }
+    else if((identifier == 0b10010000) && (syncCracksCenter != data)) {
+        for(int i = 0; i < 30; i++) {
+            if(typeList[i] == 0) {
+                typeList[i] = 1;
+                distanceList[i] = syncSteps;
+                break;
+            }
+        }
+        syncCracksCenter = data;
+    }
+    else if((identifier == 0b10100000) && (syncCracksRight != data)) {
+        for(int i = 0; i < 30; i++) {
+            if(typeList[i] == 0) {
+                typeList[i] = 1;
+                distanceList[i] = syncSteps;
+                break;
+            }
+        }
+        syncCracksRight = data;
+    }
+    else if((identifier == 0b10110000) && (syncHoles != data)) {
+        for(int i = 0; i < 30; i++) {
+            if(typeList[i] == 0) {
+                typeList[i] = 2;
+                distanceList[i] = syncSteps;
+                break;
+            }
+        }
+        syncHoles = data;
+        
+    }
+}
+
+// I2C CODE END ****************************************************************
+
+void clearKeys(){
+    keys[0] = 0;
+    keys[1] = 0;
+    keys[2] = 0;
+    keys[3] = 0;
+    keys[4] = 0;
+    keys[5] = 0;
+    keys[6] = 0;
+    keys[7] = 0;
+    keys[8] = 0;
+    keys[9] = 0;
+    keys[10] = 0;
+    keys[11] = 0;
+    keys[12] = 0;
+    keys[13] = 0;
+    keys[14] = 0;
+    keys[15] = 0;
+}
+
+void keypadInput(int n, int state){
+    if (n==0){                      //column 1
+        LATBbits.LATB0 = state;
+        LATDbits.LATD0 = 0;
+        LATBbits.LATB2 = 0;
+        LATBbits.LATB3 = 0;
+    }else if (n==1){                //column 2
+        LATBbits.LATB0 = 0;
+        LATDbits.LATD0 = state;
+        LATBbits.LATB2 = 0;
+        LATBbits.LATB3 = 0;
+    }else if (n==2){                //column 3
+        LATBbits.LATB0 = 0;
+        LATDbits.LATD0 = 0;
+        LATBbits.LATB2 = state;
+        LATBbits.LATB3 = 0;
+    }else if (n==3){                //column 4
+        LATBbits.LATB0 = 0;
+        LATDbits.LATD0 = 0;
+        LATBbits.LATB2 = 0;
+        LATBbits.LATB3 = state;
+    }
+}
+
+int keypadOutput(int num){
+    if (num == 0){
+        return PORTCbits.RC7;
+    }
+    if (num == 1){
+        return PORTCbits.RC6;
+    }
+    if (num == 2){
+        return PORTCbits.RC5;
+    }
+    if (num == 3){
+        return PORTCbits.RC2;
+    }
+}
+
+void keypadRead(){
+    // function used to detect which button is used, and do de-bouncing
+    clearKeys();
+    for (col = 0; col < numcolumns; col ++){
+        keypadInput(col,1);
+        for (row = 0;row<numrows;row++){
+                keys[4 * col + row] = keypadOutput(row);      //read across the row, then down the column
+        }
+    }
+}
+void keypadDebounce() { //Uses readings from keypadRead to generate de-bounced and transition readings.
+    for(int i = 0; i < numkeys; i++){
+        keysTransition[i] = 0;
+        if(keys[i] != keysDebounced[i] && keyStartTimes[i] < 0 ) {  //Upon detecting a new discreptancy between raw and de-bounced readings, log the time.
+            keyStartTimes[i] = time;
+        }
+        if(keys[i] != keysDebounced[i] && time - keyStartTimes[i] > debounceTime) { // update KeysDebounced if the key pressed in different
+            //If the discreptancy persists after debounceTime, accept the new reading as a debounced reading. 
+            keyStartTimes[i] = -1;
+            keysDebounced[i] = keys[i];
+            if(keys[i] == 1){
+                keysTransition[i] = 1;
+            } else {
+                keysTransition[i] = -1;
+            }
+        }
+    }
+}
+
+char getState (){
+    int i = 0;
+    for (i = 0; i< numkeys; i++){
+        if (keys[i] == 1){
+            return state[i];
+            break;
+        }
+    }
+    return ' ';
+}
+
+double timeRed1;
+double timeYellow1;
+double timeRed2;
+double timeYellow2;
+
+
+int flashYellowOnce(){
+    updateTime();
+    if(time- timeYellow1< 250){
+        LATBbits.LATB7 = 1;
+    } else if(time- timeYellow2 > 250){
+       LATBbits.LATB7 = 0;
+       return 1;
+    }
+    return 0;
+}
+int flashRedOnce(){
+    updateTime();
+    if(time- timeRed1< 250){
+        LATBbits.LATB6 = 1;
+    } else if(time- timeRed1 > 250){
+       LATBbits.LATB6 = 0;
+       return 1;
+    }
+    return 0;
+}
+int flashYellowTwice(){
+    updateTime();
+    if(time- timeYellow2< 200){
+        LATBbits.LATB7 = 1;
+    } else if(time- timeYellow2 > 200 && time- timeYellow2  < 400){
+       LATBbits.LATB7 = 0;
+    } else if (time- timeYellow2 > 400 && time- timeYellow2  < 600){
+       LATBbits.LATB7 = 1;
+    } else if (time- timeYellow2 > 600){
+       LATBbits.LATB7 = 0;
+       return 1;
+    }
+    return 0;
+}
+
+int flashRedTwice(){
+    updateTime();
+    if(time- timeRed2 < 200){
+        LATBbits.LATB6 = 1;
+    } else if(time- timeRed2 > 200 && time- timeRed2  < 400){
+       LATBbits.LATB6 = 0;
+    } else if (time- timeRed2 > 400&& time- timeRed2  < 600){
+       LATBbits.LATB6 = 1;
+    } else if (time- timeRed2 > 600){
+       LATBbits.LATB6 = 0;
+       return 1;
+    }
+    return 0;
+}
+
+void initialize(){
+        
+    // RD2 is the character LCD RS
+    // RD3 is the character LCD enable (E)
+    // RD4-RD7 are character LCD data lines
+    
+    TRISD = 0x00;
+    LATD = 0x00;
+    
+    // Set all A/D ports to digital (pg. 222)
+    ADCON1 = 0b00001111;
+    
+    TRISA = 0x00;   //A0-A3 used for conveyor stepper motor
+    LATA = 0x00;
+    
+    TRISBbits.RB6 = 0;
+    TRISBbits.RB7 = 0;
+    LATBbits.LATB6 = 0;
+    LATBbits.LATB7 = 0;
+    
+    //temporary set up for stepper motor
+    TRISBbits.RB3 = 0;  //keypad output pins
+    TRISBbits.RB2 = 0;
+    TRISDbits.RD0 = 0;
+    TRISBbits.RB0 = 0;
+    
+    //temporary stepper ends
+    
+    initLCD(); 
+    
+    T0PS2 = 1;      //maximum pre-scalar (1:256))
+    T0PS1 = 1;      
+    T0PS0 = 1;      
+    PSA = 0;        //enable pre-scalar
+    T0SE = 0;       //arbitrarily select low-to-high edge as transition
+    T0CS = 0;       //select internal instruction cycle as clock
+    T08BIT = 0;     //select 16 bit timer
+    TMR0ON = 1;     //turn the timer on
+    
+    TMR0H = 0x00;   //clear the larger value of the timer
+    TMR0L = 0x00;   //clear the smaller value of the timer
+    
+   
+    
+    I2C_Master_Init(100000); 
+    I2C_Master_Start();
+    I2C_Master_Write(0b00010000); // 7-bit Arduino slave address + write
+    I2C_Master_Stop();
+}
+
+void runstepper(int n){             // input the which position of the 4 to set to high
+    if (n==0){                      //column 1
+        LATAbits.LATA0 = 1;
+        LATAbits.LATA1 = 1;
+        LATAbits.LATA2 = 0;
+        LATAbits.LATA3 = 0;
+    }else if (n==1){                //column 2
+        LATAbits.LATA0 = 0;
+        LATAbits.LATA1 = 1;
+        LATAbits.LATA2 = 1;
+        LATAbits.LATA3 = 0;
+    }else if (n==2){                //column 3
+        LATAbits.LATA0 = 0;
+        LATAbits.LATA1 = 0;
+        LATAbits.LATA2 = 1;
+        LATAbits.LATA3 = 1;
+    }else if (n==3){                //column 4
+        LATAbits.LATA0 = 1;
+        LATAbits.LATA1 = 0;
+        LATAbits.LATA2 = 0;
+        LATAbits.LATA3 = 1;
+    }
+}
+
+int stepperStep(int step, int stepleft0right1){             //input how many steps the robot need to take and in which direction
+    updateTime();
+    if (stepcount>=step){                               
+        stepcount = 0;
+        return 1;                               //stop stepping when the necessary step to perform is attained
+    }
+    if (stepleft0right1 == 0){                      // when the robot steps to the left
+        if (time - steptime> deltatstepper){
+            steptime = time;                    //reset the counter to check when to step
+            runstepper(stepsequence);           
+            stepcount +=1;                      //count steps taken
+            curPos +=1;                         //update the position of the conveyor
+            stepsequence +=1;                   // change the sequence to move the stepper motor
+            if (stepsequence == 4){
+                stepsequence = 0;
+            }
+        }   
+    }
+    if (stepleft0right1 == 1){
+        if (time - steptime> deltatstepper){
+            steptime = time;
+            runstepper(stepsequence);
+            stepcount +=1;
+            curPos -=1;
+            stepsequence -=1;
+            if (stepsequence == -1){
+                stepsequence = 3;
+            }
+        }   
+    }
+    return 0;               // when the number of steps needed is not reached
+}
+
+int moveToPos(int pos){
+    updateTime();
+    if (pos == curPos){
+        return 1;                       //return 1 when reached the position needed
+    }
+    if (busy0Chill1 == 1){              //if the conveyor done moving, and set with a new position, it will try to reach that position
+        if (pos > curPos){
+          toMove = pos - curPos;
+          dirmTP = 0;
+        } else if (pos < curPos){
+          toMove = curPos - pos;
+          dirmTP = 1;
+        }
+    }
+    if (pos != curPos){             // don't move when the conveyor is already at the position wanted
+        busy0Chill1 = stepperStep(toMove, dirmTP);
+    }
+    return 0;                           // return 0 if not reached the desired position
+}
+
+
+
+int generalState = -2;
+int printState = -50;
+int oldPrintState = -50;
+double runStart = 0;
+double lastSendTime = 0;
+unsigned char distance = 0;
+
+
+//State 1-29: Miscellaneous
+//State 30-79: Past Data
+
+void updateUI(){
+    if (generalState == -2){        // Starting screen
+        if (keysDebounced[0] == 1){
+            generalState = 4;       //run
+        } else if (keysDebounced[1] == 1){
+            generalState = 0;       //calibration
+        } else if (keysDebounced[2] == 1){
+            generalState = -1;      // past data
+        } else {
+            printState = 0;
+        }
+    } else if (generalState == -1){     // Past data screen
+            printState = -1;
+            if (keysDebounced[14] == 1){
+                generalState = -1;       // TODO: to go through next slides of Data
+            } else if (keysDebounced[12] == 1){
+                generalState = -2;       // Return to Menu
+            }
+    } else if (generalState == 0){      // black calib start
+        if(keysDebounced[3] == 1) { 
+            generalState = 1;
+            sendByte(0b00000001);
+            printState = 1;     // Start
+        } else {
+            printState = 2;     // Press A to start black
+        }
+    }else if (generalState == 1){       // black calib stops
+        if(keysDebounced[7] == 1) {
+            generalState = 2;
+            sendByte(0b00000010);
+            printState = 3;     //stop
+        }
+        else {
+            printState = 4;     // Press B to stop black
+        }
+    } else if (generalState == 2){      // white calib start
+        if(keysDebounced[3] == 1) { 
+            generalState = 3;
+            sendByte(0b00000101);
+            printState = 1;     // Start 
+        }
+        else {
+            printState = 5;     // Press A to start white
+        }
+    }else if (generalState == 3){
+        if(keysDebounced[7] == 1) {     // white calib stops
+            generalState = -2;
+            sendByte(0b00000110);
+            printState = 3;     //stop
+        }
+        else {
+            printState = 6;     // Press B to stop white
+        }
+    } else if (generalState == 4){
+        if (keysDebounced[1] == 1){
+            distance = 0b00001000;
+            generalState = 5;
+        } else if (keysDebounced[2] == 1){
+            distance = 0b00001100;
+            generalState = 5;  ;
+        } else if (keysDebounced[4] == 1){
+            distance = 0b00010000;
+            generalState = 5;  
+        } else if (keysDebounced[5] == 1){
+            distance = 0b00010100;
+            generalState = 5; 
+        } else if (keysDebounced[6] == 1){
+            distance = 0b00011000;
+            generalState = 5;  
+        } else if (keysDebounced[8] == 1){
+            distance = 0b00011100;
+            generalState = 5;   
+        } else {
+            printState = 7;
+        }
+    }else if (generalState == 5){
+        if(keysDebounced[11] == 1) {
+            generalState = 6;
+            sendByte(distance | 0b00000001);
+            printState = 8;     // Running
+            updateTime();
+            runStart = time;    // save the starting time of the real run
+        }
+        else {
+            printState = 9;     // Press C to start real run
+        }
+    }else if (generalState == 6){
+        if(keysDebounced[15] == 1) {
+            generalState = 7;
+            sendByte(distance | 0b00000010);
+            printState = 10;     // Stopped 
+        }
+        else {
+            printState = 11;     // Press D to stop
+        }
+    }else if (generalState == 7){
+        if(keysDebounced[11] == 1) {
+            generalState = 6;
+            sendByte(distance | 0b00000001);
+        }
+        else {
+            printState = 12;     // Press C to resume
+        }
+    }
+    updateTime();
+    if(time > lastSendTime + 50) {
+        lastSendTime = time;
+//        if (printState != oldPrintState){
+        if (1) {
+            lcd_clear();
+            oldPrintState = printState;
+            switch(printState) {
+                case -1 :
+                   printf("Past Data lalala");
+                   lcd_set_ddram_addr(LCD_LINE4_ADDR);
+                   printf("*:MENU  #:NEXT");
+                   break;
+                case 0 :
+                   printf("Press");
+                   lcd_set_ddram_addr(LCD_LINE2_ADDR);
+                   printf("1: Run");
+                   lcd_set_ddram_addr(LCD_LINE3_ADDR);
+                   printf("2: Calibration");
+                   lcd_set_ddram_addr(LCD_LINE4_ADDR);
+                   printf("3: Past Run");   
+                   break;
+                case 1 :
+                   printf("START");
+                   break;
+                case 2 :
+                   printf("Press A: start  black calib");
+                   break;
+                case 3 :
+                   printf("STOP");
+                   break;
+                case 4 :
+                   printf("Press B: stop   black calib");
+                   break;
+                case 5 :
+                   printf("Press A: start  white calib");
+                   break;
+                case 6 :
+                   printf("Press B: stop   white calib");
+                   break;
+                case 7:
+                    printf("Choose Distance");
+                    lcd_set_ddram_addr(LCD_LINE2_ADDR);
+                    printf("2:200  3:300");
+                    lcd_set_ddram_addr(LCD_LINE3_ADDR);
+                    printf("4:400  5:500");
+                    lcd_set_ddram_addr(LCD_LINE4_ADDR);
+                    printf("6:600  7:700");
+                    break;
+                case 8 :
+                   printf("DEMO Running");
+                   break;
+                case 9 :
+                   printf("Press C: start  Demo");
+                   break;
+                case 10 :
+                   printf("Stopped Demo");
+                   break;
+                case 11 :
+                   printf("Running");
+                   break;
+                case 12 :
+                   printf("Press C: resume run");
+                   break;
+                default : 
+                    printf("NULL");
+             }
+        }
+    }  
+}
+
+
+int postRunState = 0;
+int postRunPrintState = 0;
+int oldPostRunPrintState = -1;
+double postRunTime = 0;
+int printIndex = 0;
+double stopTime = 0;
+int totCones = 0;
+
+void postRunUI(){
+    if (postRunState == 0){
+        postRunPrintState = 0;
+        postRunState = 0;
+        if (keysTransition[3] == 1){
+            postRunState = 1;
+        }
+    } else if (postRunState == 1) {
+        postRunPrintState = 1;
+        postRunState = 1;
+        if ((keysTransition[14] == 1) && (printIndex >= 0) && (printIndex < currentIndex - 1)){
+            printIndex += 1;       // go to the next data point
+        } else if ((keysTransition[12] == 1) && (printIndex > 0) &&  (printIndex < currentIndex)){
+            printIndex -= 1;       // go to the previous data point
+        } else if ((keysTransition[14] == 1) &&  (printIndex == currentIndex -1)){
+            printIndex = 0;      // reset printIndex
+            postRunState = 0;
+        }
+    }
+    updateTime();
+    if(time > postRunTime + 100) {
+        postRunTime = time;
+        if (1){
+            lcd_clear();
+            oldPostRunPrintState = postRunPrintState;
+            switch(postRunPrintState){
+                case 0: 
+                    printf("Cones Dep:  %d", totCones);               
+                    lcd_set_ddram_addr(LCD_LINE2_ADDR);
+                    printf("Count: %d C %d H ", syncCracksCenter + syncCracksLeft + syncCracksRight, syncHoles );
+                    lcd_set_ddram_addr(LCD_LINE3_ADDR);
+                    printf("Time(s): %0.1f", (stopTime - runStart)/1000.0 );
+                    lcd_set_ddram_addr(LCD_LINE4_ADDR);
+                    printf("A: see details");
+                    break;
+                case 1: 
+                    printf("Typ Dist Deploy",printIndex);
+                    lcd_set_ddram_addr(LCD_LINE2_ADDR);
+                    if (depploy1ignore0[printIndex] ==1 && typeList[printIndex] ==1 ){
+                       printf(" C  %d   YES", distanceList[printIndex] ); 
+                    } else if (depploy1ignore0[printIndex] ==0 && typeList[printIndex] ==1){
+                        printf(" C  %d   NO", distanceList[printIndex] );
+                    }
+                    
+                    if (depploy1ignore0[printIndex] ==1 && typeList[printIndex] ==2){
+                       printf(" H  %d   YES", distanceList[printIndex] ); 
+                    } else if (depploy1ignore0[printIndex] ==0 && typeList[printIndex] ==0){
+                        printf(" H  %d   NO", distanceList[printIndex] );
+                    }
+                    lcd_set_ddram_addr(LCD_LINE4_ADDR);
+                    if (printIndex > 0 && printIndex < currentIndex - 1){
+                        printf("*:PREV   #:NEXT");
+                    } else if (printIndex == 0){
+                        printf("         #:NEXT");
+                    } else {
+                        printf("*:PREV  #:PROMPT");
+                    }
+                    break;
+                
+            }
+        }
+    } 
+    
+}
+
+float numStepPerMm = 1.0328;
+float nextCrackPos = 0;
+float nextHolePos = 0;
+unsigned int oldSyncSteps =0;
+int R1Y0 = 0;
+
+void main(void) {
+    initialize();
+    double lastSyncTime = 0;
+    updateTime();
+    while(1){
+        flashRedTwice();
+        flashRedOnce();
+        updateTime();
+        flashYellowOnce();
+        flashYellowTwice();
+        
+        
+        
+        if(lastSyncTime + 15 < time) {
+            updateSyncVars(requestByte());
+            lastSyncTime = time;
+        }
+        if (syncTarget != 0xffff){
+            if(moveToPos(syncTarget) == 1) { // Printing causes the conveyor to slow down, so don't do it if the conveyor is moving.
+                keypadRead();
+                keypadDebounce();   //always have to run in the main loop
+                updateUI();
+            }        
+            if ((oldSyncCracksLeft != syncCracksLeft) || (oldSyncCracksRight != syncCracksRight) || (oldSyncCracksCenter != syncCracksCenter) ||(oldSyncHoles != syncHoles)){
+                oldSyncSteps = syncSteps;
+                if (oldSyncCracksLeft != syncCracksLeft) {
+                    typeList[currentIndex] = 1;
+                    oldSyncCracksLeft = syncCracksLeft;
+                } else if (oldSyncCracksRight != syncCracksRight){
+                    typeList[currentIndex] = 1;
+                    oldSyncCracksRight = syncCracksRight;
+                } else if (oldSyncCracksCenter != syncCracksCenter){
+                    typeList[currentIndex] = 1;
+                    oldSyncCracksCenter = syncCracksCenter;
+                }  else if (oldSyncHoles != syncHoles){
+                    typeList[currentIndex] = 2;
+                    oldSyncHoles = syncHoles;
+                }
+                distanceList[currentIndex] = syncSteps/numStepPerMm;
+                
+                if ((typeList[currentIndex] == 1) && (distanceList[currentIndex] > nextCrackPos)){                   //crack
+                    depploy1ignore0[currentIndex] = 1;
+                    nextCrackPos = distanceList[currentIndex] + 100 * numStepPerMm;
+                    nextHolePos = distanceList[currentIndex] + 200 * numStepPerMm;
+                    updateTime();
+                    timeYellow2=   time;
+                    totCones +=  2;
+                } else if ((typeList[currentIndex] == 2) && (distanceList[currentIndex] > nextHolePos)){            //hole
+                    nextCrackPos = distanceList[currentIndex] + 200 * numStepPerMm;
+                    nextHolePos = distanceList[currentIndex] + 150 * numStepPerMm;
+                    depploy1ignore0[currentIndex] = 1;
+                    totCones +=  1;
+                    updateTime();
+                    timeYellow1 =   time;
+                } else{
+                    depploy1ignore0[currentIndex] = 0;
+                    if (typeList[currentIndex] == 1){
+                        updateTime();
+                        timeRed2 = time;
+                    } else if (typeList[currentIndex] == 2){
+                        updateTime();
+                        timeRed1 = time;
+                    }
+                }
+                currentIndex +=1; 
+                updateTime();
+                stopTime = time;
+                
+            }
+        } else{
+            keypadRead();
+            keypadDebounce();   //always have to run in the main loop
+            postRunUI();
+            
+        }
+        
+        
+        
+    }
+}
